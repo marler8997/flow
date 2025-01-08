@@ -389,91 +389,191 @@ pub fn exit(status: u8) noreturn {
     std.posix.exit(status);
 }
 
-pub fn free_config(allocator: std.mem.Allocator, bufs: [][]const u8) void {
-    for (bufs) |buf| allocator.free(buf);
+pub fn free_config(Config: type, allocator: std.mem.Allocator, conf: *Config) void {
+    const FieldEnum = std.meta.FieldEnum(Config);
+    inline for (std.meta.fields(Config)) |field| {
+        free_config_value(Config, allocator, conf, @field(FieldEnum, field.name));
+    }
+}
+
+pub fn free_config_value(
+    Config: type,
+    allocator: std.mem.Allocator,
+    conf: *Config,
+    comptime field_enum: std.meta.FieldEnum(Config),
+) void {
+    const field = std.meta.fieldInfo(Config, field_enum);
+    const default = get_field_default(field);
+    if (config_eql(field.type, default, @field(conf, field.name))) return;
+    defer @field(conf, field.name) = default;
+    switch (field.type) {
+        []const u8 => return allocator.free(@field(conf, field.name)),
+        else => {},
+    }
+    switch (@typeInfo(field.type)) {
+        .Bool, .Int => return,
+        else => {},
+    }
+    @compileError("unsupported config type " ++ @typeName(field.type));
 }
 
 var config_mutex: std.Thread.Mutex = .{};
 
-pub fn read_config(T: type, allocator: std.mem.Allocator) struct { T, [][]const u8 } {
+fn config_value_fmt(comptime T: type) []const u8 {
+    switch (T) {
+        []const u8 => return "s",
+        else => {},
+    }
+    switch (@typeInfo(T)) {
+        .Bool, .Int => return "",
+        else => {},
+    }
+    @compileError("unsupported config type " ++ @typeName(T));
+}
+
+pub fn read_config(T: type, allocator: std.mem.Allocator) T {
     config_mutex.lock();
     defer config_mutex.unlock();
-    var bufs: [][]const u8 = &[_][]const u8{};
-    const file_name = get_app_config_file_name(application_name, @typeName(T)) catch return .{ .{}, bufs };
+    const file_name = get_app_config_file_name(application_name, @typeName(T)) catch return .{};
     var conf: T = .{};
-    read_config_file(T, allocator, &conf, &bufs, file_name);
-    read_nested_include_files(T, allocator, &conf, &bufs);
-    return .{ conf, bufs };
+    read_config_file(T, allocator, &conf, file_name);
+    read_nested_include_files(T, allocator, &conf);
+    return conf;
 }
 
-fn read_config_file(T: type, allocator: std.mem.Allocator, conf: *T, bufs: *[][]const u8, file_name: []const u8) void {
-    read_json_config_file(T, allocator, conf, bufs, file_name) catch |e|
-        std.log.err("error reading config file '{s}' {any}", .{ file_name, e });
-    return;
-}
-
-fn read_json_config_file(T: type, allocator: std.mem.Allocator, conf: *T, bufs_: *[][]const u8, file_name: []const u8) !void {
-    const cbor = @import("cbor");
-    var file = std.fs.openFileAbsolute(file_name, .{ .mode = .read_only }) catch |e| switch (e) {
-        error.FileNotFound => return,
-        else => return e,
-    };
+fn read_config_file(Config: type, allocator: std.mem.Allocator, conf: *Config, file_name: []const u8) void {
+    const FieldEnum = std.meta.FieldEnum(Config);
+    var file = std.fs.openFileAbsolute(file_name, .{ .mode = .read_only }) catch |e| return std.log.err(
+        "open config file '{s}' failed with {s}",
+        .{ file_name, @errorName(e) },
+    );
     defer file.close();
-    const json = try file.readToEndAlloc(allocator, 64 * 1024);
-    defer allocator.free(json);
-    const cbor_buf: []u8 = try allocator.alloc(u8, json.len);
-    var bufs = std.ArrayListUnmanaged([]const u8).fromOwnedSlice(bufs_.*);
-    bufs.append(allocator, cbor_buf) catch @panic("OOM:read_json_config_file");
-    bufs_.* = bufs.toOwnedSlice(allocator) catch @panic("OOM:read_json_config_file");
-    const cb = try cbor.fromJson(json, cbor_buf);
-    var iter = cb;
-    var len = try cbor.decodeMapHeader(&iter);
-    while (len > 0) : (len -= 1) {
-        var field_name: []const u8 = undefined;
-        if (!(try cbor.matchString(&iter, &field_name))) return error.InvalidConfig;
-        inline for (@typeInfo(T).Struct.fields) |field_info|
-            if (comptime std.mem.eql(u8, "include_files", field_info.name)) {
-                if (std.mem.eql(u8, field_name, field_info.name)) {
-                    var value: field_info.type = undefined;
-                    if (!(try cbor.matchValue(&iter, cbor.extract(&value)))) return error.InvalidConfig;
-                    if (conf.include_files.len > 0) {
-                        std.log.err("{s}: ignoring nested 'include_files' value '{s}'", .{ file_name, value });
-                    } else {
-                        @field(conf, field_info.name) = value;
-                    }
+    std.log.info("loading config '{s}'", .{file_name});
+    const content = file.readToEndAlloc(allocator, 64 * 1024) catch |e| return std.log.err(
+        "read config file '{s}' failed with {s}",
+        .{ file_name, @errorName(e) },
+    );
+    defer allocator.free(content);
+
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    var lineno: u32 = 0;
+    while (line_it.next()) |line_full| {
+        lineno += 1;
+        const line = std.mem.trim(u8, line_full, &std.ascii.whitespace);
+        if (line.len == 0 or std.mem.startsWith(u8, line, "#")) continue;
+        const name = line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
+        const value_str = std.mem.trim(u8, line[name.len..], &std.ascii.whitespace);
+
+        var known_config = false;
+        inline for (std.meta.fields(Config)) |field| {
+            const field_enum = @field(FieldEnum, field.name);
+            if (std.mem.eql(u8, field.name, name)) {
+                if (parse_config_value(Config, allocator, field_enum, value_str)) |value| {
+                    free_config_value(Config, allocator, conf, field_enum);
+                    @field(conf, field.name) = value;
+                    std.log.info(
+                        "config {s} {" ++ config_value_fmt(field.type) ++ "}",
+                        .{ name, value },
+                    );
+                } else |err| switch (err) {
+                    error.InvalidConfigValue => {
+                        std.log.err(
+                            "{s}:{}: config {s} has invalid value '{s}'",
+                            .{ file_name, lineno, field.name, value_str },
+                        );
+                    },
                 }
-            } else if (std.mem.eql(u8, field_name, field_info.name)) {
-                var value: field_info.type = undefined;
-                if (!(try cbor.matchValue(&iter, cbor.extract(&value)))) return error.InvalidConfig;
-                @field(conf, field_info.name) = value;
-            };
+                known_config = true;
+                break;
+            }
+        }
+        if (!known_config) {
+            std.log.err("{s}:{}: unknown config: {s}", .{ file_name, lineno, line });
+        }
     }
 }
 
-fn read_nested_include_files(T: type, allocator: std.mem.Allocator, conf: *T, bufs: *[][]const u8) void {
+pub fn get_config_default(
+    comptime Config: type,
+    field: std.meta.FieldEnum(Config),
+) std.meta.fieldInfo(Config, field).type {
+    return get_field_default(std.meta.fieldInfo(Config, field));
+}
+
+fn get_field_default(field: std.builtin.Type.StructField) field.type {
+    const default = field.default_value orelse @compileError(
+        "field " ++ field.name ++ " does not have a default value",
+    );
+    return @as(*const field.type, @alignCast(@ptrCast(default))).*;
+}
+
+fn parse_config_value(
+    Config: type,
+    allocator: std.mem.Allocator,
+    comptime field_enum: std.meta.FieldEnum(Config),
+    str: []const u8,
+) error{InvalidConfigValue}!std.meta.fieldInfo(Config, field_enum).type {
+    const field = std.meta.fieldInfo(Config, field_enum);
+    switch (field.type) {
+        []const u8 => {
+            const default = get_field_default(field);
+            if (std.mem.eql(u8, default, str)) return default;
+            return allocator.dupe(u8, str) catch @panic("OOM:parse_config_value");
+        },
+        else => {},
+    }
+    switch (@typeInfo(field.type)) {
+        .Bool => {
+            if (std.mem.eql(u8, str, "true")) return true;
+            if (std.mem.eql(u8, str, "false")) return false;
+            return error.InvalidConfigValue;
+        },
+        .Int => return std.fmt.parseInt(field.type, str, 10) catch return error.InvalidConfigValue,
+        else => {},
+    }
+    @compileError("unsupported config type " ++ @typeName(field.type));
+}
+
+fn read_nested_include_files(T: type, allocator: std.mem.Allocator, conf: *T) void {
     if (conf.include_files.len == 0) return;
     var it = std.mem.splitScalar(u8, conf.include_files, std.fs.path.delimiter);
-    while (it.next()) |path| read_config_file(T, allocator, conf, bufs, path);
+    while (it.next()) |path| read_config_file(T, allocator, conf, path);
 }
 
-pub fn write_config(conf: anytype, allocator: std.mem.Allocator) !void {
+pub fn write_config(conf: anytype) !void {
     config_mutex.lock();
     defer config_mutex.unlock();
-    return write_json_file(@TypeOf(conf), conf, allocator, try get_app_config_file_name(application_name, @typeName(@TypeOf(conf))));
+    return write_config_file(@TypeOf(conf), conf, try get_app_config_file_name(application_name, @typeName(@TypeOf(conf))));
 }
 
-fn write_json_file(comptime T: type, data: T, allocator: std.mem.Allocator, file_name: []const u8) !void {
-    const cbor = @import("cbor");
+fn write_config_file(comptime Config: type, conf: Config, file_name: []const u8) !void {
     var file = try std.fs.createFileAbsolute(file_name, .{ .truncate = true });
     defer file.close();
 
-    var cb = std.ArrayList(u8).init(allocator);
-    defer cb.deinit();
-    try cbor.writeValue(cb.writer(), data);
+    inline for (std.meta.fields(Config)) |field| {
+        const is_default = config_eql(
+            field.type,
+            get_field_default(field),
+            @field(conf, field.name),
+        );
+        const comment_prefix: []const u8 = if (is_default) "# " else "";
+        try file.writer().print(
+            "{s}{s} {" ++ config_value_spec(field.type) ++ "}\n",
+            .{ comment_prefix, field.name, @field(conf, field.name) },
+        );
+    }
+}
 
-    var s = std.json.writeStream(file.writer(), .{ .whitespace = .indent_4 });
-    var iter: []const u8 = cb.items;
-    try cbor.JsonStream(std.fs.File).jsonWriteValue(&s, &iter);
+fn config_eql(comptime T: type, a: T, b: T) bool {
+    switch (T) {
+        []const u8 => return std.mem.eql(u8, a, b),
+        else => {},
+    }
+    switch (@typeInfo(T)) {
+        .Bool, .Int => return a == b,
+        else => {},
+    }
+    @compileError("unsupported config type " ++ @typeName(T));
 }
 
 pub fn read_keybind_namespace(allocator: std.mem.Allocator, namespace_name: []const u8) ?[]const u8 {
@@ -643,7 +743,7 @@ fn get_app_state_dir(appname: []const u8) ![]const u8 {
 }
 
 fn get_app_config_file_name(appname: []const u8, comptime base_name: []const u8) ![]const u8 {
-    return get_app_config_dir_file_name(appname, base_name ++ ".json");
+    return get_app_config_dir_file_name(appname, base_name);
 }
 
 fn get_app_config_dir_file_name(appname: []const u8, comptime config_file_name: []const u8) ![]const u8 {

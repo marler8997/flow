@@ -83,16 +83,13 @@ fn start(args: StartArgs) tp.result {
 fn init(allocator: Allocator) !*Self {
     var self = try allocator.create(Self);
 
-    var conf, const conf_bufs = root.read_config(config, allocator);
-    defer root.free_config(allocator, conf_bufs);
+    var conf = root.read_config(config, allocator);
+    errdefer root.free_config(config, allocator, &conf);
 
     const theme = get_theme_by_name(conf.theme) orelse get_theme_by_name("dark_modern") orelse return tp.exit("unknown theme");
-    conf.theme = theme.name;
-    conf.whitespace_mode = try allocator.dupe(u8, conf.whitespace_mode);
-    conf.input_mode = try allocator.dupe(u8, conf.input_mode);
-    conf.top_bar = try allocator.dupe(u8, conf.top_bar);
-    conf.bottom_bar = try allocator.dupe(u8, conf.bottom_bar);
-    conf.include_files = try allocator.dupe(u8, conf.include_files);
+    root.free_config_value(config, allocator, &conf, .theme);
+    conf.theme = try allocator.dupe(u8, theme.name);
+
     if (build_options.gui) conf.enable_terminal_cursor = false;
 
     const frame_rate: usize = @intCast(tp.env.get().num("frame-rate"));
@@ -602,7 +599,7 @@ pub fn refresh_hover(self: *Self) void {
 }
 
 pub fn save_config(self: *const Self) !void {
-    try root.write_config(self.config, self.allocator);
+    try root.write_config(self.config);
 }
 
 pub fn is_mainview_focused(self: *const Self) bool {

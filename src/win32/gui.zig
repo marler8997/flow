@@ -416,8 +416,8 @@ fn entry(pid: thespian.pid) !void {
 
     const CLASS_NAME = win32.L("Flow");
 
-    const conf, _ = root.read_config(gui_config, arena_instance.allocator());
-    root.write_config(conf, arena_instance.allocator()) catch
+    const conf = root.read_config(gui_config, arena_instance.allocator());
+    root.write_config(conf) catch
         std.log.err("failed to write gui config file", .{});
 
     const initial_placement = calcWindowPlacement(
