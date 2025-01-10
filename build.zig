@@ -46,6 +46,24 @@ fn build_development(
     const target = b.standardTargetOptions(.{ .default_target = .{ .abi = if (builtin.os.tag == .linux and !tracy_enabled) .musl else null } });
     const optimize = b.standardOptimizeOption(.{});
 
+    {
+        const exe = b.addExecutable(.{
+            .name = "example",
+            .root_source_file = b.path("example.zig"),
+            .target = target,
+            .win32_manifest = b.path("src/win32/flow.manifest"),
+        });
+        if (b.lazyDependency("direct2d", .{})) |direct2d_dep| {
+            const win32_dep = direct2d_dep.builder.dependency("win32", .{});
+            const win32_mod = win32_dep.module("zigwin32");
+            exe.root_module.addImport("win32", win32_mod);
+        }
+        const install = b.addInstallArtifact(exe, .{});
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(&install.step);
+        b.step("example", "").dependOn(&run.step);
+    }
+
     return build_exe(
         b,
         run_step,
