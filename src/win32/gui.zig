@@ -75,6 +75,7 @@ const global = struct {
     };
 };
 const window_style_ex = win32.WINDOW_EX_STYLE{
+    .APPWINDOW = 1,
     //.ACCEPTFILES = 1,
 };
 const window_style = win32.WS_OVERLAPPEDWINDOW;
@@ -704,8 +705,8 @@ fn getCellSize(text_format: *win32.IDWriteTextFormat) XY(i32) {
         if (hr < 0) fatalHr("GetMetrics", hr);
     }
     return .{
-        .x = @max(1, @as(i32, @intFromFloat(@floor(metrics.width)))),
-        .y = @max(1, @as(i32, @intFromFloat(@floor(metrics.height)))),
+        .x = @max(1, @as(i32, @intFromFloat(@ceil(metrics.width)))),
+        .y = @max(1, @as(i32, @intFromFloat(@ceil(metrics.height)))),
     };
 }
 
@@ -1318,19 +1319,21 @@ fn WndProc(
             return WM_APP_ADJUST_FONTSIZE_RESULT;
         },
         WM_APP_SET_FONTSIZE => {
+            const state = stateFromHwnd(hwnd);
             const fontsize: f32 = @bitCast(@as(u32, @intCast(0xFFFFFFFFF & wparam)));
             global.fontsize = @max(fontsize, 1.0);
-            updateWindowSize(hwnd, win32.WMSZ_BOTTOMRIGHT);
+            updateWindowSize(hwnd, win32.WMSZ_BOTTOMRIGHT, &state.bounds);
             win32.invalidateHwnd(hwnd);
             return WM_APP_SET_FONTSIZE_RESULT;
         },
         WM_APP_SET_FONTFACE => {
+            const state = stateFromHwnd(hwnd);
             var fontface: [:0]const u16 = undefined;
             fontface.ptr = @ptrFromInt(wparam);
             fontface.len = @intCast(lparam);
             if (global.fontface) |old_fontface| std.heap.c_allocator.free(old_fontface);
             global.fontface = fontface;
-            updateWindowSize(hwnd, win32.WMSZ_BOTTOMRIGHT);
+            updateWindowSize(hwnd, win32.WMSZ_BOTTOMRIGHT, &state.bounds);
             win32.invalidateHwnd(hwnd);
             return WM_APP_SET_FONTFACE_RESULT;
         },
